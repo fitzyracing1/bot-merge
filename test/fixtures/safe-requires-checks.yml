@@ -1,0 +1,17 @@
+name: gated-merge
+on:
+  pull_request:
+    types: [opened, synchronize]
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: wait for CI to be lit
+        uses: lewagon/wait-on-check-action@v1.3.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: require approval
+        run: |
+          if [ "$(gh pr view $PR --json reviewDecision -q .reviewDecision)" != "APPROVED" ]; then exit 1; fi
+      - name: merge
+        run: gh pr merge $PR --merge

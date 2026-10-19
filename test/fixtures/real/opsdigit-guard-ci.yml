@@ -1,0 +1,63 @@
+name: CI
+
+# Portal CI. The spec's "no CI validation" rule is about the use-case repos
+# (markdown is enforced portal-side, not in repo CI). The PORTAL app itself is
+# ordinary software and is tested and built here on every PR and push to main.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - name: Seed content mirror (best-effort)
+        # The agent library and templates live in their own repos (du-agent-registry,
+        # du-templates). When this runner can reach them the governance/library tests
+        # validate the real files; when it cannot, those specific tests skip visibly
+        # (they carry no content of this repo). Never fails the build — hence `|| true`.
+        run: npm run content:pull || echo "content unreachable — governance/library tests will skip"
+        continue-on-error: true
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Test
+        run: npm test
+      - name: Mesh integrity
+        # The corpus must read as a graph. `npm test` asserts it too, but a
+        # dedicated step puts the full report in the log rather than one assertion.
+        run: npm run mesh:check
+
+      - name: Build
+        run: npm run build
+        env:
+          # Build must succeed with NO credentials — the app runs offline by
+          # default and only goes live when keys are present at runtime.
+          NEXT_TELEMETRY_DISABLED: "1"
+
+  guard-no-merge:
+    # Enforce constraint #1: no route/tool/function merges a pull request.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: No merge surface in the codebase
+        run: |
+          if grep -rnE "\.(merge|mergePullRequest)\s*\(|merge_pull_request|pulls\.merge" lib app 2>/dev/null; then
+            echo "::error::Found a merge call — the gate boundary depends on merges staying a human act (constraint #1)."
+            exit 1
+          fi
+          echo "OK — no merge surface."

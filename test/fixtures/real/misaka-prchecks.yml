@@ -1,0 +1,1103 @@
+name: Misaka Network Agent Auditor
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to audit"
+        required: false
+        type: string
+
+jobs:
+  audit:
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          fetch-depth: 0
+
+      # ── Scope Detection (Issue #230) ──
+      - name: Detect Change Scope
+        id: scope
+        run: |
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+
+          # workflow_dispatch has no PR context — always full
+          if [ -z "$BASE_SHA" ] || [ -z "$HEAD_SHA" ]; then
+            echo "scope=full" >> "$GITHUB_OUTPUT"
+            echo "Scope: full (workflow_dispatch)"
+            exit 0
+          fi
+
+          CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+          NON_LESSON=$(echo "$CHANGED" | grep -Ev '^(lessons/|\.github/workflows/(lesson-quality|pr-checks)\.ya?ml$)' || true)
+          NON_WORKFLOW=$(echo "$CHANGED" | grep -Ev '^\.github/workflows/[^/]+\.ya?ml$' || true)
+          NON_JS_DEPS=$(echo "$CHANGED" | grep -Ev '^(package|package-lock)\.json$' || true)
+
+          if [ -z "$NON_LESSON" ]; then
+            echo "scope=lessons-only" >> "$GITHUB_OUTPUT"
+            echo "Scope: lessons-only"
+          elif [ -z "$NON_WORKFLOW" ]; then
+            echo "scope=ci-only" >> "$GITHUB_OUTPUT"
+            echo "Scope: ci-only (GitHub Actions/workflow changes)"
+          elif [ -z "$NON_JS_DEPS" ]; then
+            echo "scope=js-deps-only" >> "$GITHUB_OUTPUT"
+            echo "Scope: js-deps-only (root package manifest/lockfile changes)"
+          else
+            echo "scope=full" >> "$GITHUB_OUTPUT"
+            echo "Scope: full (code or mixed changes)"
+          fi
+
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
+        with:
+          # 3.11, not 3.10: this job runs the whole test suite, and two of its files import
+          # `tomllib` (stdlib only from 3.11), so on 3.10 pytest died during **collection**
+          # (`ModuleNotFoundError: tomllib`, exit 2) before running a single test. The audit then
+          # reported "Audit failed: test suite has issues" — blaming the contribution for a runner
+          # version. Measured 2026-09-25 while triaging the open backlog: **3 of the 11 open PRs**
+          # (#1999, #2020, #1982) carried exactly this, so their red `audit` said nothing about their
+          # content. (The others that were red were a genuine DCO failure and two PRs whose audit
+          # never ran at all — different problems.) The required matrix (`ci-cross-platform.yml`) has
+          # always been 3.11/3.12/3.13; this job was the outlier.
+          # `tests/test_workflow_python_floors.py` derives the suite's floor from the imports in
+          # tests/ and fails any pytest job that pins something lower.
+          python-version: "3.11"
+          cache: pip
+
+      # The worker suite needs node; the Python steps in this job do not assume it.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
+        with:
+          node-version: "22"
+
+      # uv, for `tests/test_uv_lock_is_current.py`. Declared here, outside the
+      # `scope == 'full'` condition on the install step below, on purpose: behind that condition a
+      # lessons-only pull request would have no `uv`, every test in that file would skip, and the
+      # uv.lock drift they exist to catch would go unseen — the "gate that skips" failure this
+      # repository has already paid for once (see the comment above the `ruff` install).
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+
+      - name: Install Dependencies
+        if: steps.scope.outputs.scope == 'full'
+        run: |
+          echo "=== Installing core dependencies ==="
+          # requirements.txt ends with `-e .` (the repository's own package), which means a PEP 517
+          # build. A pull request that breaks pyproject.toml must not lose its whole test run to
+          # that: install everything else first, then try the editable install on its own and say so
+          # when it fails. `PYTHONPATH` below keeps the suite running against the checkout either
+          # way — which is the arrangement that made the repo drop `-e .` in the first place
+          # (lessons/contrib/ci-dco-decouple-pythonpath-fork-pr.md); this keeps the convenience
+          # without re-creating the all-or-nothing failure.
+          grep -v '^[[:space:]]*-e[[:space:]]*\.' requirements.txt > /tmp/requirements-external.txt
+          pip install -r /tmp/requirements-external.txt \
+            || { echo "::error::Core dependency install failed"; exit 1; }
+          if pip install --no-deps -e . ; then
+            echo "=== Editable install of this repository succeeded ==="
+          else
+            echo "::warning::Could not install this checkout in editable mode (pyproject build failed). The test suite still runs against PYTHONPATH=. The console script and \`import misakanet\` outside the repo will not work for this run."
+          fi
+          echo "=== Installing optional dependencies ==="
+          find . -path ./venv -prune -o -name "requirements.txt" -print | while IFS= read -r req; do
+            dir=$(dirname "$req")
+            if [ "$dir" != "." ]; then
+              echo "  Installing $req ..."
+              pip install -r "$req" 2>&1 || echo "  ⚠️ Optional install failed: $req"
+            fi
+          done
+          echo "=== Test dependencies ==="
+          # `ruff` is not a style pass here: `tests/test_python_undefined_names.py` shells out to it for
+          # F821/F811 only (undefined names and shadowed imports — the two classes that shipped on
+          # 2026-09-28 in code no test drives). Without it in this install the gate skips and the
+          # failure mode it exists for is invisible again.
+          pip install pytest pytest-cov ruff
+          echo "PYTHONPATH=$(pwd):$PYTHONPATH" >> "$GITHUB_ENV"
+          echo "=== Dependency install complete ==="
+
+      - name: Install Schema Dependencies
+        if: steps.scope.outputs.scope == 'lessons-only'
+        run: |
+          pip install pyyaml jsonschema
+          echo "PYTHONPATH=$(pwd):$PYTHONPATH" >> "$GITHUB_ENV"
+
+      # ── Quality Score Gate (full scope only) ──
+      # The `audit` job is a required check, so it always runs; this step, which is deterministic work
+      # nobody needs on a branch that auto-merges itself, skips the automation's own branches. Measured
+      # 2026-10-02: `leaderboard-watch` (deleted on 2026-10-15 — the ranking it snapshotted is now the
+      # worker's daily cron, #1919) opened 15 of the last 100 pull requests from its own bot branch, a
+      # median of 84 minutes apart; `pr-agent-review.yml` is the paid model call in that set (this action
+      # is `gh api` + `bc` + `grep`, and `pr-genius` is handed no model credential). The ruleset requires
+      # four checks on `main` — DCO, `test (ubuntu-latest, 3.11)`, `gate`, `audit` — so this job must not
+      # be skipped wholesale.
+      - name: Agent Quality Score
+        if: steps.scope.outputs.scope == 'full' && !startsWith(github.head_ref, 'bot/')
+        id: score
+        continue-on-error: true
+        uses: ./.github/actions/score-agent
+        with:
+          pr-number: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+          repo: "Ikalus1988/MisakaNet"
+          threshold: "50"
+          gh-token: ${{ secrets.SHELDON_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Reject Low-Quality PR
+        if: steps.scope.outputs.scope == 'full' && steps.score.outcome == 'success' && steps.score.outputs.verdict == 'fail'
+        env:
+          GH_TOKEN: ${{ secrets.SHELDON_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUM="${{ github.event.pull_request.number }}"
+          echo "=== Low-Quality PR #$PR_NUM Rejected ==="
+          echo "Score: ${{ steps.score.outputs.score }}/100"
+          gh pr close "$PR_NUM" --repo Ikalus1988/MisakaNet \
+            --comment "### Quality Score Failed
+
+          Your PR scored ${{ steps.score.outputs.score }}/100 (minimum: 50).
+
+          Issues detected:
+          ${{ steps.score.outputs.reasons }}
+
+          Please clean up formatting noise and resubmit."
+          exit 1
+
+      # ── DCO Audit Gate (all PRs) ──
+      # Uses the local copy of the dco-audit action so the comment wording is
+      # versioned in-repo (issue #1498). Scan semantics: --no-merges.
+      - name: DCO Audit
+        id: dco
+        uses: ./.github/actions/dco-audit
+        with:
+          base-sha: ${{ github.event.pull_request.base.sha }}
+          head-sha: ${{ github.event.pull_request.head.sha }}
+          token: ${{ secrets.SHELDON_PAT || secrets.GITHUB_TOKEN }}
+          repo: "Ikalus1988/MisakaNet"
+          pr-number: ${{ github.event.pull_request.number || '' }}
+
+      - name: Fail on DCO Violation
+        if: steps.dco.outputs.dco-passed == 'false' && !contains(github.event.pull_request.user.login, 'dependabot')
+        run: |
+          echo "DCO check failed: ${{ steps.dco.outputs.failed-count }} commit(s) without sign-off."
+          exit 1
+
+      # Clean stale DCO block comments once DCO passes so the PR thread
+      # no longer contradicts the green checks (issue #1498). Matches both
+      # the current marker and legacy REGULATORY BLOCK comments.
+      - name: Remove stale DCO block comments
+        if: steps.dco.outputs.dco-passed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SHELDON_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUM="${{ github.event.pull_request.number || '' }}"
+          [ -z "$PR_NUM" ] && exit 0
+          # `--paginate` (2026-10-04): a one-page read of a 249-comment PR (measured: #2020) only
+          # ever sees the oldest hundred comments, so stale DCO blocks past that point survived a
+          # cleanup that reported success. One id per line per page is what the delete loop wants.
+          for cid in $(gh api "repos/Ikalus1988/MisakaNet/issues/$PR_NUM/comments?per_page=100" --paginate \
+            --jq '.[] | select((.body | contains("misakanet-dco-block")) or (.body | contains("AUTOMATED AUDIT SYSTEM: REGULATORY BLOCK"))) | .id' 2>/dev/null); do
+            gh api -X DELETE "repos/Ikalus1988/MisakaNet/issues/comments/$cid" >/dev/null 2>&1 || true
+          done
+          echo "Stale DCO block comments cleaned."
+
+      # ── PR Size Check (full scope only) ──
+      - name: Check PR Size
+        if: steps.scope.outputs.scope == 'full'
+        id: prsize
+        run: |
+          CHANGED=${{ github.event.pull_request.changed_files || 0 }}
+          ADDITIONS=${{ github.event.pull_request.additions || 0 }}
+          SUSPICIOUS=false
+          NOTES=""
+          if [ "$CHANGED" -gt 10 ]; then
+            SUSPICIOUS=true
+            NOTES="Warn ${CHANGED} files changed (threshold: 10)"
+          fi
+          if [ "$ADDITIONS" -gt 500 ]; then
+            SUSPICIOUS=true
+            NOTES="${NOTES}; ${ADDITIONS} lines added (threshold: 500)"
+          fi
+          echo "suspicious=${SUSPICIOUS}" >> "$GITHUB_OUTPUT"
+          echo "notes=${NOTES}" >> "$GITHUB_OUTPUT"
+          printf '## PR Size Check\n\n| Metric | Value |\n|--------|-------|\n| Files Changed | %s |\n| Lines Added | %s |\n| Suspicious | %s |\n\n' "${CHANGED}" "${ADDITIONS}" "${SUSPICIOUS}" >> "$GITHUB_STEP_SUMMARY"
+
+      # ── Secret Scanning (full scope only) ──
+      # ── Secret Scanning ──
+      # No scope condition, on purpose. It used to be `if: steps.scope.outputs.scope == 'full'`, which
+      # meant a docs-only PR never ran it — and the scanner it runs reads `workers/**` only, so even
+      # the "full" path looked at nothing in `docs/`. On 2026-09-25 a docs-only PR (#1982) was one step
+      # from merging two live-looking node tokens pasted into its smoke reports, and no gate in this
+      # repository had an opinion about that. Both scans take seconds; both now run for every scope.
+      - name: Secret Scan
+        id: secrets
+        run: |
+          echo "=== Scanning for hardcoded secrets ==="
+          FAILED=0
+          # Run both even when the first fails: a second scanner's findings must not be hidden by the
+          # first one's exit code.
+          python3 scripts/check_worker_secrets.py || FAILED=1
+          python3 scripts/check_published_secrets.py || FAILED=1
+          if [ "$FAILED" = "0" ]; then
+            echo "secrets_result=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "secrets_result=fail" >> "$GITHUB_OUTPUT"
+            echo "::error::Secret scan found hardcoded secrets — blocking merge"
+            exit 1
+          fi
+
+      # ── Security Checks (full scope, non-blocking advisory) ──
+      - name: Security Advisory Checks
+        if: steps.scope.outputs.scope == 'full'
+        run: |
+          echo "=== Security Advisory Checks ==="
+          ISSUES=0
+
+          # 1. CI/CD pinned actions (check workflow files use SHA)
+          echo "--- Checking workflow action pinning ---"
+          for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
+            [ -f "$wf" ] || continue
+            # The first grep is the whole check: it selects tag-pinned `uses:`, which is exactly
+            # what the warning is about. A second `grep -v '@[a-f0-9]{40}'` used to follow it,
+            # and an external review correctly noticed that `{40}` there is a literal in a basic
+            # regular expression, so the filter matched nothing. Giving that grep `-E` — the
+            # review's suggestion — makes it live and makes the check **worse**: `[a-f0-9]` does
+            # not contain `v`, so the filter can only fire on a line that mentions a 40-hex SHA
+            # somewhere *else* on the line, and it then suppresses a genuine tag pin. Measured on
+            # a line that is tag-pinned and also names the SHA it was upgraded from: without `-E`
+            # it is reported (correct), with `-E` it is dropped (a real finding, lost). So the
+            # filter is removed rather than repaired. A `uses:` line cannot be both `@v1` and
+            # `@<40 hex>` at the same position, which is why it was dead.
+            #
+            # Full-line comments are dropped first, because a `uses:` inside a comment is prose
+            # and not a pin. Two of them exist today — the note above and one in
+            # `release-please.yml` — and both were being reported as unpinned actions. Only whole
+            # comment lines are removed, never a trailing `#…`, so a `#` inside a quoted string
+            # cannot be mistaken for a comment. The same reasoning as the orphan-test rule in
+            # tests/test_workflow_inventory.py, which reads workflows through `yaml.safe_load`
+            # precisely so that a comment cannot satisfy it.
+            UNPINNED=$(grep -vE '^[[:space:]]*#' "$wf" \
+              | grep -E 'uses: [a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+@v[0-9]' || true)
+            if [ -n "$UNPINNED" ]; then
+              echo "::warning file=$wf::Unpinned actions (should use SHA): $UNPINNED"
+              ISSUES=$((ISSUES + 1))
+            fi
+          done
+
+          # 2. Overly broad permissions
+          echo "--- Checking workflow permissions ---"
+          for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
+            [ -f "$wf" ] || continue
+            if grep -q 'permissions:.*write-all' "$wf" 2>/dev/null; then
+              echo "::warning file=$wf::Overly broad permissions (write-all)"
+              ISSUES=$((ISSUES + 1))
+            fi
+          done
+
+          # 3. README quality
+          echo "--- Checking README quality ---"
+          if [ -f README.md ]; then
+            HAS_DESCRIPTION=$(grep -c "## What is this\|## Quick Start\|## Try it" README.md || echo "0")
+            if [ "$HAS_DESCRIPTION" -eq 0 ]; then
+              echo "::warning::README missing description/quickstart section"
+              ISSUES=$((ISSUES + 1))
+            fi
+          fi
+
+          # 4. Code style (TODOs, debug code)
+          echo "--- Checking code style ---"
+          TODOS=$(grep -rn "TODO\|FIXME\|HACK\|XXX" scripts/ --include="*.py" 2>/dev/null | grep -v "test" | wc -l || echo "0")
+          if [ "$TODOS" -gt 5 ]; then
+            echo "::warning::Found $TODOS TODO/FIXME items in scripts/"
+            ISSUES=$((ISSUES + 1))
+          fi
+
+          if [ "$ISSUES" -gt 0 ]; then
+            echo "security_advisory=$ISSUES issues found (non-blocking)" >> "$GITHUB_OUTPUT"
+          else
+            echo "security_advisory=pass" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── Dependency Audit (dependency scopes only) ──
+      - name: Dependency Audit
+        id: depaudit
+        if: steps.scope.outputs.scope == 'full' || steps.scope.outputs.scope == 'js-deps-only'
+        run: |
+          # Only audit ecosystems whose dependency files changed
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+
+          # workflow_dispatch runs have no base/head PR SHAs — nothing to diff
+          if [ -z "$BASE_SHA" ] || [ -z "$HEAD_SHA" ]; then
+            echo "Manual (workflow_dispatch) run — no PR diff; dependency audit skipped"
+            echo "depaudit_result=skipped" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+          PY_DEPS_CHANGED=false
+          JS_DEPS_CHANGED=false
+          if echo "$CHANGED" | grep -qE '(^|/)requirements\.txt$|^pyproject\.toml$'; then
+            PY_DEPS_CHANGED=true
+          fi
+          if echo "$CHANGED" | grep -qE '^(package|package-lock)\.json$'; then
+            JS_DEPS_CHANGED=true
+          fi
+
+          if [ "$PY_DEPS_CHANGED" != "true" ] && [ "$JS_DEPS_CHANGED" != "true" ]; then
+            echo "No Python/JS dependency files changed — dependency audit skipped"
+            echo "depaudit_result=skipped" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          AUDIT_FAIL=false
+          if [ "$PY_DEPS_CHANGED" = "true" ]; then
+            echo "=== Python dependency audit ==="
+            pip install pip-audit 2>/dev/null || true
+            if ! pip-audit --requirement requirements.txt 2>&1; then
+              AUDIT_FAIL=true
+              echo "::error::pip-audit found vulnerabilities in changed Python dependencies"
+            fi
+          else
+            echo "Python dependency files unchanged — skipping pip-audit"
+          fi
+
+          if [ "$JS_DEPS_CHANGED" = "true" ]; then
+            echo "=== JS dependency audit ==="
+            if [ -f package.json ]; then
+              if ! npm audit --audit-level=high 2>&1; then
+                AUDIT_FAIL=true
+                echo "::error::npm audit found high-severity issues in changed JS dependencies"
+              fi
+            fi
+          else
+            echo "JS dependency files unchanged — skipping npm audit"
+          fi
+
+          if [ "$AUDIT_FAIL" = "true" ]; then
+            echo "depaudit_result=fail" >> "$GITHUB_OUTPUT"
+            exit 1
+          else
+            echo "depaudit_result=pass" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── Test Suite (full scope only) ──
+      - name: Run Test Suite
+        if: steps.scope.outputs.scope == 'full'
+        id: pytest
+        run: |
+          set +e
+          # These files were ignored for years while passing: a test that exists but
+          # never runs is worse than no test, because it reads as coverage (this
+          # repository has already been bitten twice — workers/d1-fts-search.test.mjs sat
+          # red on main because it was missing from the CI list). Audited 2026-09-13:
+          # every file here passes locally on Linux with no network or clock dependence
+          # (voice_hooks 16, voice_prompts 12, benchmark_fixtures 3, phase_b_orchestrator
+          # 4, queue_lesson_dry_run 3, ci_self_heal 8, evidence_levels 34,
+          # intake_spam_guard needs mcp>=2.1.1 which this job installs).
+          # Coverage measures `misakanet/` only (`--cov=misakanet`). `scripts/` used to be
+          # passed here as well, but `[tool.coverage.run] omit = ["scripts/*"]` in
+          # pyproject.toml excludes it at both depths (`*` crosses `/`), so it contributed
+          # 0 lines and the printed TOTAL only ever described `misakanet/`. Dropping the
+          # flag makes the command say what it measures; not measuring `scripts/` is
+          # accepted debt, recorded in pyproject.toml and docs/ci-gates.md.
+          pytest --cov=misakanet --cov-report=term --cov-report=xml --cov-fail-under=20 \
+            tests/ 2>&1 | tee pytest_report.txt
+          PYTEST_EXIT=${PIPESTATUS[0]}
+          echo "pytest_exit=$PYTEST_EXIT"
+          # Handed to the summary step below, which is the only place the *cause* is turned into the
+          # one line a maintainer reads. Exit codes are pytest's, not ours: 1 = tests failed,
+          # 2 = interrupted (a collection error), 4 = usage error, 5 = nothing collected.
+          echo "exit=$PYTEST_EXIT" >> "$GITHUB_OUTPUT"
+          exit $PYTEST_EXIT
+        continue-on-error: true
+
+      # ── The worker suite (this is what makes it gate) ──────────────────────────────────────────────
+      # The quoted `workers/**/*.test.mjs` glob is the only automated verification of
+      # `workers/register-proxy-sw.js`: the MCP endpoint, the search ranking (BM25 + the CJK channel + the
+      # relevance floor) and every public `/api/*` route. It ran in `mcp-stress.yml`, which is **not** a
+      # required check, so a red worker test merged green-looking — and until 2026-09-29 that workflow's
+      # trigger paths named 6 of its 59 test files, so most of them did not run on the PRs that changed
+      # them. The `audit` job *is* required, and this step puts the suite behind the same verdict as the
+      # Python one (the suite runs in seconds; see `mcp-stress.yml`).
+      #
+      # The quotes are load-bearing: unquoted, the shell expands `workers/**/*.test.mjs` to the *nested*
+      # files only (here, just email-register), which is a different suite; quoted, node expands it and
+      # matches at every depth (`**` spans zero or more directories). `workers/*.test.mjs` reached 65 of
+      # the 66 `.test.mjs` files in the tree and silently skipped
+      # `workers/email-register/email-utils.test.mjs`, which `make deploy-email` ships — that file was
+      # executed by no workflow until 2026-10-02.
+      - name: Run Worker Test Suite (node)
+        if: steps.scope.outputs.scope == 'full'
+        id: node_tests
+        # This step deliberately does **not** carry `continue-on-error` (it did until 2026-10-02).
+        # A step that swallows its own failure hands the job a green conclusion: the verdict block
+        # below already read `steps.node_tests.outcome`, so a red worker suite produced an `::error`
+        # annotation — and nothing else. `audit` is the required check, so it stayed green and a PR
+        # with a failing worker suite could auto-merge. Failing the step outright is what makes
+        # `audit` red; the explicit `exit 1` in "Exit with failure if any hard gate fails" is the
+        # second lock, and the one that says *why* in the job log.
+        run: |
+          set +e
+          node --test 'workers/**/*.test.mjs' 2>&1 | tee node_worker_report.txt
+          NODE_EXIT=${PIPESTATUS[0]}
+          echo "exit=$NODE_EXIT" >> "$GITHUB_OUTPUT"
+          echo "Worker suite exit: $NODE_EXIT"
+          exit $NODE_EXIT
+
+
+      # `tests/frontend.test.js` is the only frontend module the repository has a test for, and
+      # until 2026-10-07 it ran nowhere: it imported `vitest`, which the root `package.json` does
+      # not depend on and `node_modules/vitest` does not contain. `pytest` collects `test_*.py`
+      # only, so the `audit` job never saw it either — the same shape as `tests/dsh/`, deleted in
+      # #2920. It is ported to `node:test` now (the runner the other 74 worker tests use), and
+      # this step is what stops that from being true again: a file that nothing runs is a file
+      # that checks nothing, and this job is the required check.
+      #
+      # No `tee` here on purpose — there is no report artefact to keep, and a pipe would need
+      # `PIPESTATUS` handling that this step has no reason to get wrong.
+      - name: Run Frontend Test Suite (node)
+        if: steps.scope.outputs.scope == 'full'
+        run: node --test tests/frontend.test.js
+
+      - name: Upload Coverage to Codecov
+        if: steps.scope.outputs.scope == 'full'
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5  # v7
+        with:
+          files: ./coverage.xml
+          fail_ci_if_error: false
+
+      - name: Parse Coverage
+        if: steps.scope.outputs.scope == 'full'
+        id: coverage
+        run: |
+          coverage=$(grep -oP 'TOTAL\s+\d+\s+\d+\s+\K\d+(?=%)' pytest_report.txt || echo "0")
+          echo "rate=$coverage" >> "$GITHUB_OUTPUT"
+          echo "Coverage: ${coverage}%"
+          OUTCOME="${{ steps.pytest.outcome }}"
+          if [ "$OUTCOME" = "success" ]; then
+            RESULT="PASS"
+          else
+            RESULT="FAIL"
+          fi
+          printf '## Test Suite\n\n| Metric | Value |\n|--------|-------|\n| Outcome | %s |\n| Coverage | %s%% |\n\n' "${RESULT}" "${coverage}" >> "$GITHUB_STEP_SUMMARY"
+
+      # ── Type Checking (full scope only) ──
+      - name: Type Check (mypy)
+        if: steps.scope.outputs.scope == 'full'
+        id: mypy
+        continue-on-error: true
+        run: |
+          pip install mypy
+          mypy misakanet/ --ignore-missing-imports 2>&1 | tee mypy_report.txt
+          MYPY_EXIT=${PIPESTATUS[0]}
+          echo "mypy_exit=$MYPY_EXIT" >> "$GITHUB_OUTPUT"
+          if [ "$MYPY_EXIT" -eq 0 ]; then
+            echo "✅ mypy passed"
+          else
+            echo "⚠️ mypy found issues (non-blocking)"
+          fi
+
+      # ── Lesson Schema Validation (all PRs) ──
+      - name: Validate Lesson Schema
+        id: schema
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.SHELDON_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUM="${{ github.event.inputs.pr_number }}"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+            mapfile -t TARGETS < <(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- 'lessons/**/*.md' 'lessons/*.md')
+          elif [ -n "$PR_NUM" ]; then
+            # Manual audit of one PR: validate only the lessons that PR touches.
+            mapfile -t TARGETS < <(gh pr diff "$PR_NUM" --repo Ikalus1988/MisakaNet --name-only 2>/dev/null \
+              | grep -E '^lessons/.*\.md$' || true)
+          else
+            # No PR context: a whole-corpus sweep fails on legacy lessons by design,
+            # which made every workflow_dispatch run red for reasons unrelated to
+            # the audit (2026-09-13) and hid the real signal. Skip the gate; the
+            # corpus is validated by lesson-gate.yml on changed files.
+            TARGETS=()
+            echo "No PR context — schema gate skipped. Pass the pr_number input to audit a specific PR."
+          fi
+
+          RESULT=pass
+          if [ "${#TARGETS[@]}" -eq 0 ]; then
+            echo "No changed lesson markdown files."
+          else
+            for target in "${TARGETS[@]}"; do
+              [ -f "$target" ] || continue
+              if ! python3 scripts/validate_lessons.py "$target"; then
+                RESULT=fail
+              fi
+            done
+          fi
+
+          if [ "$RESULT" = "pass" ]; then
+            echo "schema_result=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "schema_result=fail" >> "$GITHUB_OUTPUT"
+            echo "⚠️ Schema validation produced warnings or errors" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # ── Lesson Count Consistency Check ──
+      # The *real* invariant, through the count SSOT, and it fails. What stood here was a heuristic that
+      # compared `find lessons/core lessons/contrib -name '*.md'` against the number of `data/lessons.json`
+      # rows and, on a mismatch, printed `::warning::` and then `✅` — it could not fail, and the two
+      # numbers it compared are different facts by design (`canonical_lessons` de-duplicates stems across
+      # directories and excludes templates, so the file count is *expected* to be larger). A gate that
+      # cannot fail and measures the wrong thing is worse than no gate: it reads as coverage.
+      #
+      # `sync_lesson_count.py --check` compares every managed surface (README, ARCHITECTURE, the site's
+      # meta tags, llms.txt …) against `canonical_count()`, and exits non-zero on drift. It was already
+      # running on the release path; this puts it on the PR path too, where count sentences are edited.
+      - name: Lesson Count Check
+        if: steps.scope.outputs.scope == 'full'
+        run: |
+          echo "=== Lesson Count Consistency (count SSOT) ==="
+          python3 scripts/sync_lesson_count.py --check
+
+      # ── Site Facts Check (#1895) ──
+      # The homepage Quickstart's command strings (install / verify / MCP search curl) are copies
+      # of the README's, and the homepage's tool count is a retype of `canonical_mcp_tools()`.
+      # `sync_site_facts.py --check` is the same SSOT idea as the count gate above, for facts that
+      # are not corpus counts: a one-character drift between the two surfaces must fail here with
+      # both files named, instead of shipping a site that teaches a command the README does not.
+      - name: Site Facts Check
+        if: steps.scope.outputs.scope == 'full'
+        run: |
+          echo "=== Site Facts Consistency (homepage commands + tool count) ==="
+          python3 scripts/sync_site_facts.py --check
+
+      - name: Validate lessons.json schema
+        run: |
+          echo "=== lessons.json Schema Validation (Issue #1374) ==="
+          python3 -c "
+          import json, sys
+          REQUIRED = {'id','title','domain','tags','summary','preview','url','triggers','verified','evidence_level','trust_score'}
+          data = json.load(open('data/lessons.json', encoding='utf-8'))
+          missing = set()
+          for entry in data:
+              for field in REQUIRED:
+                  if field not in entry:
+                      missing.add(field)
+          if missing:
+              print(f'::error::lessons.json missing required fields: {sorted(missing)}')
+              print('This likely means misakanet-index.py was used instead of update_lessons_json.py (Issue #1374)')
+              sys.exit(1)
+          print(f'Schema OK: {len(data)} entries, all required fields present')
+          "
+
+      # ── Audit Report (all PRs) ──
+      - name: Post Audit Report
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.SHELDON_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          SCOPE="${{ steps.scope.outputs.scope }}"
+          OUTCOME="${{ steps.pytest.outcome }}"
+          NODE_OUTCOME="${{ steps.node_tests.outcome }}"
+          PYTEST_EXIT="${{ steps.pytest.outputs.exit }}"
+          COVERAGE="${{ steps.coverage.outputs.rate }}"
+          SUSPICIOUS="${{ steps.prsize.outputs.suspicious }}"
+          SIZE_NOTES="${{ steps.prsize.outputs.notes }}"
+          SCORE="${{ steps.score.outputs.score }}"
+          REASONS="${{ steps.score.outputs.reasons }}"
+          DCO_RESULT="${{ steps.dco.outputs.dco-passed }}"
+          DCO_FAILED="${{ steps.dco.outputs.failed-count }}"
+          SCHEMA="${{ steps.schema.outputs.schema_result }}"
+          SECRETS="${{ steps.secrets.outputs.secrets_result }}"
+          DEPAUDIT="${{ steps.depaudit.outputs.depaudit_result }}"
+          PR_NUM="${{ github.event.inputs.pr_number || github.event.pull_request.number }}"
+          SHA="${{ github.event.pull_request.head.sha || 'manual' }}"
+          SHA_SHORT=$(echo "$SHA" | cut -c1-7)
+
+          # ── Build report ──
+          REPORT="## 🧾 Audit Report — PR #${PR_NUM} (${SHA_SHORT})"
+
+          if [ "$SCOPE" = "lessons-only" ]; then
+            REPORT+=$'\n\n'
+            REPORT+="> 📚 **Lessons-only PR** — skipped: quality score, PR size, dependency audit, test suite"
+          elif [ "$SCOPE" = "ci-only" ]; then
+            REPORT+=$'\n\n'
+            REPORT+="> ⚙️ **CI-only PR** — skipped Python/JS dependency audit and test suite; DCO + schema still run."
+          elif [ "$SCOPE" = "js-deps-only" ]; then
+            REPORT+=$'\n\n'
+            REPORT+="> 📦 **JS dependency-only PR** — runs JS dependency audit; skips unrelated Python tests."
+          fi
+          REPORT+=$'\n\n'
+
+
+          # 1. Quality Score (full scope only)
+          if [ "$SCOPE" = "full" ]; then
+            REPORT+="### 📊 Quality Score"
+            REPORT+=$'\n\n'
+            if [ -z "$SCORE" ]; then
+              REPORT+="⚠️ Quality score unavailable; continuing with hard gates."
+            elif [ -n "$REASONS" ]; then
+              REPORT+="Score: ${SCORE}/100"
+              REPORT+=$'\n\n'
+              REPORT+="**Deductions:**"
+              REPORT+=$'\n'
+              echo "$REASONS" | while IFS= read -r line; do
+                [ -n "$line" ] && REPORT+="- ${line}"$'\n'
+              done
+            else
+              REPORT+="Score: ${SCORE}/100 — no deductions."
+            fi
+            REPORT+=$'\n\n'
+          fi
+
+          # 2. DCO Audit
+          REPORT+="### 🔏 DCO Audit"
+          REPORT+=$'\n\n'
+          if [ "$DCO_RESULT" = "true" ]; then
+            REPORT+="✅ All commits signed-off."
+          else
+            REPORT+="❌ **${DCO_FAILED} commit(s)** missing Signed-off-by."
+          fi
+          REPORT+=$'\n\n'
+
+          # 3. PR Size (full scope only)
+          if [ "$SCOPE" = "full" ]; then
+            REPORT+="### 📏 PR Size"
+            REPORT+=$'\n\n'
+            REPORT+="| Metric | Value |"
+            REPORT+=$'\n'
+            REPORT+="|--------|-------|"
+            REPORT+=$'\n'
+            REPORT+="| Files Changed | ${{ github.event.pull_request.changed_files }} |"
+            REPORT+=$'\n'
+            REPORT+="| Lines Added | ${{ github.event.pull_request.additions }} |"
+            REPORT+=$'\n'
+            if [ "$SUSPICIOUS" = "true" ]; then
+              REPORT+="| ⚠️ Warning | ${SIZE_NOTES} |"
+            fi
+            REPORT+=$'\n\n'
+          fi
+
+          # 4. Secret Scan (full scope only)
+          if [ "$SCOPE" = "full" ]; then
+            REPORT+="### 🔐 Secret Scan"
+            REPORT+=$'\n\n'
+            if [ "$SECRETS" = "pass" ]; then
+              REPORT+="✅ No hardcoded secrets detected."
+            elif [ "$SECRETS" = "fail" ]; then
+              REPORT+="❌ **Hardcoded secrets found** — merge blocked."
+            else
+              REPORT+="⏭️ Skipped."
+            fi
+            REPORT+=$'\n\n'
+          fi
+
+          # 5. Dependency Audit (dependency scopes only)
+          if [ "$SCOPE" = "full" ] || [ "$SCOPE" = "js-deps-only" ]; then
+            REPORT+="### 📦 Dependency Audit"
+            REPORT+=$'\n\n'
+            if [ "$DEPAUDIT" = "pass" ]; then
+              REPORT+="✅ No known vulnerabilities in changed dependency ecosystem(s)."
+            elif [ "$DEPAUDIT" = "fail" ]; then
+              REPORT+="❌ **Vulnerabilities found in changed dependencies** — merge blocked."
+            else
+              REPORT+="⏭️ Skipped; no Python/JS dependency files changed."
+            fi
+            REPORT+=$'\n\n'
+          fi
+
+          # 6. Test Suite (full scope only)
+          if [ "$SCOPE" = "full" ]; then
+            REPORT+="### 🧪 Test Suite"
+            REPORT+=$'\n\n'
+            if [ "$OUTCOME" = "success" ]; then
+              # The rate comes from `Parse Coverage`, which runs *after* the worker suite: when that
+              # suite fails the job, every later step is skipped and `COVERAGE` is empty. "PASS —
+              # % coverage" would be the same kind of half-true line this report exists to
+              # eliminate, so print the rate only when we actually have it.
+              REPORT+="✅ **PASS**"
+              if [ -n "$COVERAGE" ]; then
+                REPORT+=" — ${COVERAGE}% coverage"
+              fi
+            elif [ "$OUTCOME" = "skipped" ]; then
+              # `skipped` is not `failed`. A step whose `if:` contains no status function inherits an
+              # implicit `success()`, so one red gate earlier in this job (DCO, most often) skips every
+              # later step — including this one, which then reports `skipped` while describing itself
+              # as a failure. On 2026-09-20 that is what #1959/#1960/#1961 got: "❌ **FAIL** — tests
+              # have failures" for a suite that never started, which sends a contributor hunting for
+              # test failures that do not exist. Not verified is still not a pass (see the verdict
+              # below) — but the report has to say which of the two it is.
+              REPORT+="⏭️ **Did not run** — an earlier gate failed before it could start (see above)."
+            elif [ -n "$OUTCOME" ]; then
+              REPORT+="❌ **FAIL** — tests have failures"
+              if [ -n "$COVERAGE" ]; then
+                REPORT+=" (${COVERAGE}% coverage)"
+              fi
+            else
+              REPORT+="⏭️ Skipped (manual run without PR context)."
+            fi
+            REPORT+=$'\n\n'
+          fi
+
+          # 7. Schema Validation
+          REPORT+="### 📋 Lesson Schema"
+          REPORT+=$'\n\n'
+          if [ "$SCHEMA" = "pass" ]; then
+            REPORT+="✅ All lessons valid."
+          elif [ "$SCHEMA" = "fail" ]; then
+            REPORT+="⚠️ Schema validation produced warnings."
+          else
+            REPORT+="⏭️ Skipped (no lessons changed)."
+          fi
+          REPORT+=$'\n\n'
+
+          # 8. Verdict
+          REPORT+="### ⚖️ Verdict"
+          REPORT+=$'\n\n'
+          VERDICT_PASS=true
+
+          if [ "$DCO_RESULT" != "true" ]; then
+            REPORT+="❌ DCO audit failed."$'\n'
+            VERDICT_PASS=false
+          fi
+
+          if [ "$SCOPE" = "js-deps-only" ] && [ "$DEPAUDIT" = "fail" ]; then
+            REPORT+="❌ Dependency audit found vulnerabilities in changed JS dependencies."$'\n'
+            VERDICT_PASS=false
+          fi
+
+          if [ "$SCOPE" = "full" ]; then
+            if [ -n "$SCORE" ] && [ "$SCORE" -lt 40 ] 2>/dev/null; then
+              REPORT+="❌ Quality Score ${SCORE}/40 below threshold."$'\n'
+              VERDICT_PASS=false
+            fi
+            if [ "$SECRETS" = "fail" ]; then
+              REPORT+="❌ Secret scan found hardcoded secrets."$'\n'
+              VERDICT_PASS=false
+            fi
+            if [ "$DEPAUDIT" = "fail" ]; then
+              REPORT+="❌ Dependency audit found vulnerabilities."$'\n'
+              VERDICT_PASS=false
+            fi
+            if [ -n "$NODE_OUTCOME" ] && [ "$NODE_OUTCOME" != "success" ]; then
+              # Same distinction as the Python suite: skipped (an earlier gate failed) is not failed, but
+              # both keep the verdict red — an unverified PR must not read as green.
+              if [ "$NODE_OUTCOME" = "skipped" ]; then
+                REPORT+="❌ Worker test suite (node) did not run (an earlier gate failed)."$'\n'
+              else
+                REPORT+="❌ Worker test suite (node) failed — the worker is the MCP endpoint, search and the public API."$'\n'
+              fi
+              VERDICT_PASS=false
+            fi
+
+            if [ -n "$OUTCOME" ] && [ "$OUTCOME" != "success" ]; then
+              # Same distinction as in the report above: a suite that never ran is not a suite that
+              # failed. Both keep the verdict red — an unverified PR must not read as green — but the
+              # sentence a contributor acts on is now the true one.
+              if [ "$OUTCOME" = "skipped" ]; then
+                REPORT+="❌ Test suite did not run (an earlier gate failed)."$'\n'
+              else
+                REPORT+="❌ Test suite failed."$'\n'
+              fi
+              VERDICT_PASS=false
+            fi
+          fi
+
+          if [ "$SCHEMA" = "fail" ]; then
+            REPORT+="❌ Lesson schema validation failed."$'\n'
+            VERDICT_PASS=false
+          fi
+
+          if [ "$VERDICT_PASS" = "true" ]; then
+            if [ "$SCOPE" = "lessons-only" ]; then
+              REPORT+="✅ DCO + schema passed. Ready for merge."
+            elif [ "$SCOPE" = "ci-only" ]; then
+              REPORT+="✅ CI-only gates passed. Ready for merge."
+            elif [ "$SCOPE" = "js-deps-only" ]; then
+              REPORT+="✅ JS dependency audit + DCO + schema passed. Ready for merge."
+            else
+              REPORT+="✅ All gates passed. Ready for merge."
+            fi
+          fi
+          REPORT+=$'\n\n---\n'
+          REPORT+="_Scope: \`${SCOPE}\` | Triggered by \`${SHA_SHORT}\` | [View run](https://github.com/Ikalus1988/MisakaNet/actions/runs/${{ github.run_id }})_"
+
+          # ── Publish the verdict where it cannot be lost ──
+          # On a fork PR the token is read-only, so the comment below warns and
+          # posts nothing: the contributor then sees a red check with no reason
+          # (PR #1657, 2026-09-13 — the real cause was a test that had gone stale
+          # on main, and the explanation never reached them). The step summary is
+          # readable by anyone who opens the run, and an annotation turns up on
+          # the PR's Checks page without needing write access.
+          # `paste -sd '; '` would cycle the delimiters ('a;b c'); use one delimiter
+          # and space it, so the annotation reads "A; B" for any number of gates.
+          FAILED_GATES=$(printf '%s\n' "$REPORT" | sed -n '/### ⚖️ Verdict/,$p' | grep '^❌' \
+            | sed 's/^❌ //; s/\.$//' | paste -sd ';' - | sed 's/;/; /g')
+          {
+            echo "## 🧾 Audit Report — PR #${PR_NUM:-manual} (${SHA_SHORT})"
+            echo
+            echo "$REPORT"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$VERDICT_PASS" = "true" ]; then
+            echo "::notice title=Audit verdict::All gates passed."
+          else
+            echo "::error title=Audit verdict failed::${FAILED_GATES:-see the run summary}"
+          fi
+
+          # ── Post comment (upsert: update the previous report in place
+          #    instead of stacking a new comment per run — issue #1498) ──
+          if [ -n "$PR_NUM" ]; then
+            MARKER='<!-- misakanet-audit-report -->'
+            REPORT_FILE=$(mktemp)
+            printf '%s\n%s\n' "$MARKER" "$REPORT" > "$REPORT_FILE"
+            # `--paginate` (2026-10-04) is what makes the upsert an upsert. GitHub returns issue
+            # comments oldest-first, so page 1 of `per_page=100` is the *oldest* hundred, and
+            # `tail -n1` over one page picks the hundredth comment rather than the newest.
+            # Measured on PR #2020: 249 comments, 113 of them carrying this marker, and **0 of the
+            # 113 on page 1** — so `EXISTING_ID` came back empty on every run and each run POSTed
+            # another report instead of patching. That is the duplicate-report pileup described in
+            # the note below, still growing (53 on 2026-09-25, 113 by 2026-10-04).
+            # Under `--paginate` the jq emits one id per line per page and `tail -n1` takes the
+            # newest of them, which is the intent the un-paginated call only approximated.
+            EXISTING_ID=$(gh api "repos/Ikalus1988/MisakaNet/issues/$PR_NUM/comments?per_page=100" --paginate \
+              --jq ".[] | select(.body | contains(\"$MARKER\")) | .id" 2>/dev/null | tail -n1)
+            if [ -n "$EXISTING_ID" ]; then
+              # `-f body="$(cat …)"`, not `-f body=@$REPORT_FILE`: `--raw-field` does **not** read
+              # `@file` (only `-F/--field` and `--input` do), so this call posted the literal string
+              # `@/tmp/tmp.XXXXXXXX` as the comment body — and it *succeeded*, so the `||` fallbacks never
+              # ran. Every audit run replaced the previous report with a file path, the marker vanished,
+              # and the next run created another one: the release PR had **53** of them and no readable
+              # verdict on 2026-09-25, which is exactly the state nobody can act on.
+              gh api -X PATCH "repos/Ikalus1988/MisakaNet/issues/comments/$EXISTING_ID" \
+                -f "body=$(cat "$REPORT_FILE")" >/dev/null 2>&1 || \
+                gh issue comment "$PR_NUM" --repo Ikalus1988/MisakaNet --body-file "$REPORT_FILE" 2>/dev/null || \
+                echo "::warning::Could not update the report comment on PR #$PR_NUM (read-only fork token) — the report is in this run's summary and as a check annotation."
+            else
+              gh issue comment "$PR_NUM" --repo Ikalus1988/MisakaNet --body-file "$REPORT_FILE" 2>/dev/null || \
+                echo "::warning::Could not post the report comment to PR #$PR_NUM (read-only fork token) — the report is in this run's summary and as a check annotation."
+            fi
+            rm -f "$REPORT_FILE"
+          fi
+
+          # ── Exit with failure if any hard gate fails ──
+          if [ "$SCOPE" = "full" ] && [ "$SECRETS" = "fail" ]; then
+            echo "Audit failed: hardcoded secrets detected."
+            exit 1
+          fi
+          # Note: dep audit blocking is handled in the dep audit step itself
+          # (only blocks when dependency files actually changed)
+          if [ "$SCOPE" = "full" ] && [ -n "$OUTCOME" ] && [ "$OUTCOME" != "success" ]; then
+            # "test suite has issues" was the whole message for days while the suite never ran: on
+            # 3.10 pytest aborted during *collection* (`ModuleNotFoundError: tomllib`, exit 2), and
+            # the audit blamed the PR for a runner version (3 of the 11 open PRs on 2026-09-25).
+            # A red gate has to name its cause, or the reader has to go and find it — which is how
+            # 3 PRs sat blocked on a one-line workflow bug.
+            case "$PYTEST_EXIT" in
+              2)
+                echo "Audit failed: pytest could not COLLECT the suite (exit 2) — an import or conftest error, so no test ran at all. This is normally the runner, not the contribution: check the python-version this job pins."
+                ;;
+              4) echo "Audit failed: pytest usage error (exit 4) — the invocation is wrong, not the tests." ;;
+              5) echo "Audit failed: pytest collected no tests (exit 5)." ;;
+              1) echo "Audit failed: test suite has failing tests (exit 1)." ;;
+              *) echo "Audit failed: test suite has issues (pytest exit ${PYTEST_EXIT:-unknown})." ;;
+            esac
+            exit 1
+          fi
+          # The worker suite is a hard gate for the same reason the Python one is (see the comment
+          # above `Run Worker Test Suite (node)`): it is the only automated verification of
+          # `workers/register-proxy-sw.js` — the MCP endpoint, search and every public `/api/*` route.
+          # Without this guard a red node suite reached the report, set `VERDICT_PASS=false`, printed
+          # an `::error` and still exited 0, so the required `audit` check was green (measured
+          # 2026-10-02). Same shape and same `SCOPE` condition as the pytest guard above: the node
+          # step only runs for `full`, so `lessons-only` / `ci-only` / `js-deps-only` PRs — for which
+          # the outcome is empty or `skipped` by design — cannot be failed by this.
+          if [ "$SCOPE" = "full" ] && [ -n "$NODE_OUTCOME" ] && [ "$NODE_OUTCOME" != "success" ]; then
+            if [ "$NODE_OUTCOME" = "skipped" ]; then
+              echo "Audit failed: the worker test suite (node) did not run — an earlier gate failed before it could start."
+            else
+              echo "Audit failed: worker test suite (node) has failing tests (node --test 'workers/**/*.test.mjs')."
+            fi
+            exit 1
+          fi
+          if [ "$DCO_RESULT" != "true" ]; then
+            echo "Audit failed: DCO violations."
+            exit 1
+          fi
+          if [ "$SCHEMA" = "fail" ]; then
+            echo "Audit failed: lesson schema validation failed."
+            exit 1
+          fi
+
+      # ── Auto-Merge Gate (all PRs) ──
+      - name: Auto-Merge Gate
+        if: success() && github.event_name == 'pull_request'
+        env:
+          # The PAT alone, with no `|| secrets.GITHUB_TOKEN` fallback. The fallback is what the
+          # empty-token guard below was written against ("no token at all"), except it made that case
+          # unreachable: `secrets.GITHUB_TOKEN` is always non-empty, so a run with no PAT proceeded and
+          # tried to merge with a token this job deliberately limits to `contents: read` — a merge
+          # writes to the base branch, and the failure would be the same `Resource not accessible by
+          # integration` red the fork guard above exists to prevent. Declaring `contents: write` for the
+          # audit job is not the fix: this job runs the pull request's own tests, so handing it write
+          # access to the repository would let a branch that reached the repo through `adopt-pr` rewrite
+          # `main` from a test. Enabling auto-merge is a convenience, not a gate (the rule the fork, CI
+          # and release guards state in the same words), so when the PAT is missing the step says so and
+          # stays green; a maintainer merges. `tests/test_auto_merge_gate.py` pins all three.
+          GH_TOKEN: ${{ secrets.SHELDON_PAT }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+        run: |
+          echo "=== Auto-Merge Gate for PR #$PR_NUM ==="
+
+          # A fork PR cannot be auto-merged, and saying so must not fail the audit.
+          #
+          # A `pull_request` run from a fork gets a read-only GITHUB_TOKEN and no repository secrets,
+          # so the `gh pr merge` at the end of this step answers
+          # `GraphQL: Resource not accessible by integration (mergePullRequest)` — and because this
+          # step belongs to the `audit` job, that permission error turned the whole audit check red on
+          # PRs whose every real gate had passed. On 2026-09-20 it did exactly that to #1952 and #1954
+          # (both "1638 passed": no test, schema, secret or DCO failure anywhere). A red check that
+          # only means "you opened your PR from a fork" is worse than no check: `audit` is the single
+          # check contributors are told to trust, and it was lying in the direction that costs them
+          # the most attention.
+          #
+          # The token guard below does not catch this: for a fork PR `secrets.SHELDON_PAT` is empty and
+          # `GITHUB_TOKEN` is still non-empty, so the guard passes and the run goes on to merge.
+          #
+          # Enabling auto-merge is a convenience, not a gate — the same rule `auto-merge-docs.yml`
+          # states in the same words ("if it cannot be … a maintainer will merge it manually"), and the
+          # same reason `auto-merge-lessons.yml` carries `continue-on-error: true`. A maintainer merges
+          # fork PRs by hand; this run just says so and stays green.
+          HEAD_REPO="${{ github.event.pull_request.head.repo.full_name }}"
+          if [ "$HEAD_REPO" != "${{ github.repository }}" ]; then
+            echo "  Fork PR (head repo: ${HEAD_REPO:-deleted fork}) — read-only token cannot enable auto-merge."
+            echo "  A maintainer merges this PR by hand once the checks are green."
+            {
+              echo "### Auto-merge: skipped for a fork PR"
+              echo
+              echo 'This run has a read-only token (`pull_request` runs from forks get no repository'
+              echo 'secrets), so it cannot call `gh pr merge --auto`. Auto-merge is a convenience, not a'
+              echo 'gate: a maintainer merges this PR by hand.'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice title=Auto-merge skipped::Fork PR — a maintainer merges this by hand. Not a failure."
+            exit 0
+          fi
+
+          # Fork PRs are already gone by now, so this covers the remaining case: no token at all
+          # (a missing secret on a same-repo run). Nothing to merge with — report, do not fail.
+          #
+          # This branch used to be dead code: the step's `GH_TOKEN` was
+          # `secrets.SHELDON_PAT || secrets.GITHUB_TOKEN`, and the second operand is never empty, so a
+          # run with no PAT fell through to a merge attempt with a token this job scopes to
+          # `contents: read` — the red-with-no-cause shape this file keeps having to fix. The env line
+          # above is now the PAT alone, which is what makes this guard reachable.
+          if [ -z "$GH_TOKEN" ]; then
+            echo "  SKIP: GH_TOKEN is empty — auto-merge needs a token with pull-requests: write."
+            echo "::warning title=Auto-merge skipped::No GH_TOKEN in this run."
+            exit 0
+          fi
+
+          # `mergeable` from this REST endpoint is a JSON **boolean** — `true`, `false`, or `null`
+          # while GitHub is still computing it. The GraphQL enum spelling is `MERGEABLE`, and this
+          # line compared the two: always unequal, so the gate skipped every PR and "all green PRs
+          # auto-merge" was a branch that could never be reached — 0 `Auto-merge #N` commits in the
+          # whole history (#1826). `scripts/lesson_pr_mergeable.py::mergeable_is_clean` documents the
+          # same trap and is the canonical helper for Python callers; here the comparison is one line,
+          # so what matters is that only the boolean counts as mergeable (`null` must NOT).
+          MERGEABLE=$(gh api repos/Ikalus1988/MisakaNet/pulls/$PR_NUM --jq '.mergeable')
+          echo "Mergeable: $MERGEABLE"
+          [ "$MERGEABLE" = "true" ] || { echo "Not mergeable ($MERGEABLE). Skipping."; exit 0; }
+
+          # Security gate (2026-08-30): lessons/ changes must never auto-merge.
+          # Lesson content is executed by agents; auto-merging attacker-authored
+          # lesson files (e.g. from auto-generated intake PRs) is a poisoning
+          # vector. Any PR touching lessons/ requires human merge.
+          # One `gh pr diff` for both rules below — the file list is the only thing they need.
+          CHANGED_FILES=$(gh pr diff "$PR_NUM" --repo Ikalus1988/MisakaNet --name-only 2>/dev/null || true)
+          CHANGED_LESSONS=$(printf '%s\n' "$CHANGED_FILES" | grep -c "^lessons/" || true)
+          echo "Changed lesson files: $CHANGED_LESSONS"
+          [ "$CHANGED_LESSONS" -gt 0 ] && { echo "PR touches lessons/ — human merge required. Skipping auto-merge."; exit 0; }
+
+          # A PR that changes a workflow cannot have auto-merge enabled by this token, and that is a
+          # credential limit rather than a fault in the PR — so it must not fail the audit either.
+          #
+          # GitHub refuses the call outright when the enabling credential is a PAT without the
+          # `workflow` scope, because enabling auto-merge on such a PR would let it merge a change to
+          # CI itself:
+          #
+          #   GraphQL: Pull request refusing to allow a Personal Access Token to create or update
+          #   workflow `.github/workflows/pr-checks.yml` without `workflow` scope (enablePullRequestAutoMerge)
+          #
+          # Measured on #1964 (2026-09-20): `audit` red — after "Mergeable: true / Changed lesson
+          # files: 0 / Unchecked AC items: 0", i.e. with every real gate green. Same shape as the fork
+          # case above, same conclusion: enabling auto-merge is a convenience, not a gate. If the
+          # credential ever gains the `workflow` scope, delete this block and the skip disappears on
+          # its own — that is a decision about what a token may do, not about this workflow.
+          CHANGED_WORKFLOWS=$(printf '%s\n' "$CHANGED_FILES" | grep -c "^\.github/workflows/" || true)
+          echo "Changed workflow files: $CHANGED_WORKFLOWS"
+          if [ "$CHANGED_WORKFLOWS" -gt 0 ]; then
+            echo "  This PR edits CI. SHELDON_PAT has no \`workflow\` scope, so auto-merge cannot be enabled."
+            echo "  A maintainer merges it by hand — which is the right reader for a change to CI anyway."
+            {
+              echo "### Auto-merge: skipped for a CI change"
+              echo
+              echo "This PR touches \`.github/workflows/\`. Enabling auto-merge on it needs a token with"
+              echo "the \`workflow\` scope; the PAT used here does not have it. Auto-merge is a convenience,"
+              echo "not a gate — a maintainer merges it by hand."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice title=Auto-merge skipped::PR edits .github/workflows/ — a maintainer merges it by hand. Not a failure."
+            exit 0
+          fi
+
+          # Release PRs are the one artifact a person should read before it ships: they carry the version
+          # bump and the changelog that becomes the release notes. On 2026-09-20 this gate merged the
+          # 2.32.0 release PR while the maintainer was still reviewing its changelog — which turned out to
+          # hold 30 duplicated entries, and shipped as 2.32.0. (The duplication itself is now caught by
+          # `tests/test_changelog_shape.py`; the point here is that nobody had the chance to look.)
+          #
+          # Detected by the label release-please maintains, with the branch name as a fallback for the
+          # window before the label is applied.
+          PR_LABELS=$(gh api "repos/Ikalus1988/MisakaNet/issues/$PR_NUM" --jq '[.labels[].name] | join(",")' 2>/dev/null || echo "")
+          case "$PR_LABELS" in
+            *"autorelease:"*)
+              echo "Release PR (labels: $PR_LABELS) — human merge required. Skipping auto-merge."; exit 0 ;;
+          esac
+          PR_BRANCH=$(gh api "repos/Ikalus1988/MisakaNet/pulls/$PR_NUM" --jq '.head.ref' 2>/dev/null || echo "")
+          case "$PR_BRANCH" in
+            release-please--*)
+              echo "Release PR (branch: $PR_BRANCH) — human merge required. Skipping auto-merge."; exit 0 ;;
+          esac
+
+          BODY=$(gh api repos/Ikalus1988/MisakaNet/pulls/$PR_NUM --jq '.body')
+          UNCHECKED=$(echo "$BODY" | grep -c "\[ \]" || true)
+          echo "Unchecked AC items: $UNCHECKED"
+          [ "$UNCHECKED" -gt 0 ] && { echo "AC not all checked. Skipping."; exit 0; }
+
+          # `--squash`, and the history of this line is worth keeping because two earlier fixes here
+          # were both incomplete:
+          #
+          #   * it used to write `--subject "Auto-merge #N: <the PR title>"`, and that conventional
+          #     subject was counted by release-please as a *second* changelog entry next to the branch
+          #     commit it merged (#1820 appeared twice in the 2.31.0 notes);
+          #   * the fix was to drop `--subject`, on the reasoning that GitHub's default merge subject
+          #     ("Merge pull request #N from <branch>") is not conventional. **The subject is not where
+          #     the duplicate comes from.** GitHub's default merge commit puts the PR *title* in the
+          #     **body**, and release-please reads the whole message. Measured 2026-09-25 against
+          #     main's own history:
+          #
+          #         Merge pull request #2047 from Ikalus1988/feat/done-but-open-detector
+          #         <blank line>
+          #         feat(intake): detect intakes whose work is already merged but whose issue is still open
+          #
+          #     so `a6923ea` (the merge) and `fd1bbca` (the branch commit it merged, same files) each
+          #     produced an entry — and the 2.35.0 release PR arrived with **113 entries covering 103
+          #     duplicates**.
+          #
+          # A squash merge produces exactly one commit per PR and no merge commit at all, which is what
+          # `auto-merge-docs`, `auto-merge-lessons` and `scripts/ci/land_change.py` already do. This
+          # line was the last path that did not.
+          gh pr merge "$PR_NUM" --repo Ikalus1988/MisakaNet --squash --auto
+          echo "Auto-merge enabled for PR #$PR_NUM"

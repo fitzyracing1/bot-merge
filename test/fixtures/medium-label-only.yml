@@ -1,0 +1,14 @@
+name: label-merge
+on:
+  pull_request:
+    types: [labeled]
+permissions:
+  contents: write
+  pull-requests: write
+jobs:
+  maybe-merge:
+    if: contains(github.event.pull_request.labels.*.name, 'automerge')
+    runs-on: ubuntu-latest
+    steps:
+      - name: enable automerge
+        run: gh pr merge --auto --squash "$PR"
