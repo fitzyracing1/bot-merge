@@ -1,0 +1,10 @@
+{
+  "name": "bot-merge",
+  "version": "0.1.0",
+  "description": "Auto-merge allowlisted bot PRs once their CI light is lit; open a revert PR if main goes dark.",
+  "type": "module",
+  "license": "MIT",
+  "private": true,
+  "engines": { "node": ">=20" },
+  "scripts": { "test": "node --test" }
+}

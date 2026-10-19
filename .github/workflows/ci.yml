@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # workflow_dispatch lets bot-merge / make-test-pr start CI on refs they pushed with
+  # GITHUB_TOKEN (pushes made with GITHUB_TOKEN do not trigger push/pull_request runs).
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Unit tests (node --test)
+        run: npm test

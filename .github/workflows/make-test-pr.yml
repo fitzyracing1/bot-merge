@@ -1,0 +1,53 @@
+name: make-test-pr
+
+# Demo only: opens a PR as github-actions[bot] so bot-merge can be exercised end to end.
+#   kind=lit  -> trivial change under demo/, CI stays lit, bot-merge should merge it
+#   kind=dark -> adds a deliberately failing test under demo/, CI goes dark, bot-merge must not merge it
+
+on:
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: 'lit or dark'
+        type: choice
+        options: [lit, dark]
+        default: lit
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+jobs:
+  make-test-pr:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      KIND: ${{ inputs.kind }}
+      BRANCH: demo/${{ inputs.kind }}-${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Commit a demo change
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -c "$BRANCH"
+          echo "demo $KIND change from run ${{ github.run_id }} at $(date -u +%FT%TZ)" > "demo/$KIND-${{ github.run_id }}.txt"
+          if [ "$KIND" = dark ]; then
+            cat > "demo/dark-${{ github.run_id }}.test.mjs" <<'JS'
+          import { test } from 'node:test';
+          import assert from 'node:assert/strict';
+          test('deliberately dark demo check', () => assert.fail('this PR is meant to be dark'));
+          JS
+          fi
+          git add demo
+          git commit -m "demo: $KIND test change (${{ github.run_id }})"
+          git push origin "$BRANCH"
+      - name: Open PR
+        run: |
+          gh pr create --base main --head "$BRANCH" \
+            --title "demo: $KIND bot PR (${{ github.run_id }})" \
+            --body "Opened by make-test-pr as github-actions[bot]. Expected light: **$KIND**."
+      - name: Start CI on the PR branch
+        # GITHUB_TOKEN pushes don't trigger CI, but workflow_dispatch does.
+        run: gh workflow run ci.yml --ref "$BRANCH"

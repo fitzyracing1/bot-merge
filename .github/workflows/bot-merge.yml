@@ -1,0 +1,75 @@
+name: bot-merge
+
+on:
+  check_suite:
+    types: [completed]
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+  pull_request:
+    types: [opened, synchronize, reopened]
+  # Merges, PRs and pushes made with GITHUB_TOKEN do not trigger other workflows,
+  # so also sweep on a schedule and allow manual runs.
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'What to run'
+        type: choice
+        options: [merge, guard, both]
+        default: merge
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  checks: read
+  statuses: read
+  actions: write
+
+concurrency:
+  group: bot-merge
+  cancel-in-progress: false
+
+jobs:
+  bot-merge:
+    # Merge sweep: everything except a CI run that finished on main (that is the guard's job).
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.mode != 'guard') ||
+      github.event_name == 'schedule' ||
+      github.event_name == 'pull_request' ||
+      github.event_name == 'check_suite' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.head_branch != 'main')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Merge lit bot PRs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node src/bot-merge.mjs merge
+
+  revert-guard:
+    # After main's checks finish: if a bot-merge left main dark, open a revert PR + issue.
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.mode != 'merge') ||
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.head_branch == 'main')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Revert guard
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || '' }}
+        run: node src/bot-merge.mjs guard $SHA

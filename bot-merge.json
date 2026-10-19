@@ -1,0 +1,13 @@
+{
+  "bots": [
+    "github-actions[bot]",
+    "dependabot[bot]",
+    "renovate[bot]",
+    "fitzyracing1-bot"
+  ],
+  "mergeMethod": "squash",
+  "requiredLight": "lit",
+  "baseBranch": "main",
+  "ignoreChecks": ["bot-merge", "revert-guard", "make-test-pr"],
+  "dispatchCiWorkflow": "ci.yml"
+}
