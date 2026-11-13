@@ -6,5 +6,9 @@
   "license": "MIT",
   "private": true,
   "engines": { "node": ">=20" },
-  "scripts": { "test": "node --test" }
+  "scripts": { "test": "node --test" },
+  "funding": {
+    "type": "github",
+    "url": "https://github.com/sponsors/fitzyracing1"
+  }
 }
